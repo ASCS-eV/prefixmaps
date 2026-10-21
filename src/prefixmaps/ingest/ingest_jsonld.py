@@ -10,6 +10,7 @@ import yaml
 
 from prefixmaps.data import data_path
 from prefixmaps.datamodel.context import Context
+from prefixmaps.io.parser import load_context
 
 AT_CONTEXT = "@context"
 
@@ -131,6 +132,34 @@ def from_prefixcc() -> Context:
             )
         }
     return from_jsonld_context(jsonld_context, "prefixcc", PREFIXCC_EXCLUDE)
+
+
+def from_prefixcc_snapshot() -> Context:
+    """
+    Loads the prefix.cc snapshot bundled with this package.
+
+    prefix.cc has no curation, so it is not refreshed by default, see
+    https://github.com/linkml/prefixmaps/issues/61. To fix a semweb prefix, add it to
+    linked_data.curated.yaml, which takes precedence over prefix.cc in merged contexts.
+
+    Entries listed in prefixcc.excluded.yaml are still dropped, so a new exclusion takes
+    effect on the next ETL run. Canonical expansions come first, so that merging the
+    snapshot gives the same statuses as merging a fresh download. That relies on prefix.cc
+    having no prefix aliases, which holds because its prefixes are unique and lowercase.
+
+    :return:
+    """
+    exclusions = load_prefixcc_exclusions()
+    context = load_context("prefixcc")
+    context.prefix_expansions = sorted(
+        (
+            pe
+            for pe in context.prefix_expansions
+            if not is_excluded_from_prefixcc(pe.prefix, pe.namespace, exclusions)
+        ),
+        key=lambda pe: not pe.canonical(),
+    )
+    return context
 
 
 def load_prefixcc_exclusions(

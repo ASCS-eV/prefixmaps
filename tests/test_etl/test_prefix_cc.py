@@ -4,11 +4,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from prefixmaps.datamodel.context import Context, StatusType
+from prefixmaps.ingest.etl_runner import CONTEXTS, echo_changes, run_etl
 from prefixmaps.ingest.ingest_jsonld import (
     from_prefixcc,
+    from_prefixcc_snapshot,
     is_excluded_from_prefixcc,
     load_prefixcc_exclusions,
 )
+from prefixmaps.io.parser import context_from_file, load_context
 from tests import INPUT_DIR
 
 EXPECTED = [
@@ -55,6 +59,27 @@ class TextETLForPrefixCC(unittest.TestCase):
             with self.subTest(namespace=namespace):
                 self.assertEqual(expected, is_excluded_from_prefixcc("x", namespace, exclusions))
 
+    def test_snapshot(self):
+        """Test that the ETL uses the bundled prefix.cc snapshot without network access."""
+        with mock.patch("requests.get", side_effect=AssertionError("prefix.cc was downloaded")):
+            context = CONTEXTS["prefixcc"]()
+        self.assertEqual(load_context("prefixcc").as_dict(), context.as_dict())
+        self.assertEqual(from_prefixcc_snapshot().as_dict(), context.as_dict())
+        statuses = [pe.canonical() for pe in context.prefix_expansions]
+        self.assertEqual(
+            sorted(statuses, reverse=True), statuses, msg="canonical rows must come first"
+        )
+        # canonical-first ordering only reproduces the merge if prefix.cc has no prefix aliases
+        self.assertNotIn(StatusType.prefix_alias, {pe.status for pe in context.prefix_expansions})
+
+    def test_snapshot_exclusions(self):
+        """Test that a new exclusion is applied to the bundled prefix.cc snapshot."""
+        self.assertIn("foaf", load_context("prefixcc").as_dict())
+        exclusions = {"hosts": {"xmlns.com": "test"}, "prefixes": {}}
+        target = "prefixmaps.ingest.ingest_jsonld.load_prefixcc_exclusions"
+        with mock.patch(target, return_value=exclusions):
+            self.assertNotIn("foaf", from_prefixcc_snapshot().as_dict())
+
     def test_prefix_cc_without_context(self):
         """Test that a prefix.cc response without a JSON-LD context is still rejected."""
         response = mock.Mock(json=mock.Mock(return_value={}))
@@ -84,3 +109,43 @@ class TextETLForPrefixCC(unittest.TestCase):
             for entry, reason in entries.items():
                 with self.subTest(kind=kind, entry=entry):
                     self.assertTrue(reason)
+
+    def test_echo_changes(self):
+        """Test that refreshing prefix.cc reports added and removed expansions."""
+        old, new = Context("prefixcc"), Context("prefixcc")
+        old.add_prefix("a", "https://example.org/a/")
+        old.add_prefix("b", "https://example.org/b/")
+        new.add_prefix("a", "https://example.org/a2/")
+        new.add_prefix("b", "https://example.org/b/")
+        new.add_prefix("c", "https://example.org/c/")
+        new.add_prefix("d", "https://example.org/c/")
+        with mock.patch("click.echo") as echo:
+            echo_changes(old, new)
+        self.assertEqual(
+            [
+                mock.call("- prefixcc a https://example.org/a/ canonical"),
+                mock.call("+ prefixcc a https://example.org/a2/ canonical"),
+                mock.call("+ prefixcc c https://example.org/c/ canonical"),
+                mock.call("+ prefixcc d https://example.org/c/ namespace_alias"),
+            ],
+            echo.call_args_list,
+        )
+
+    def test_refresh_prefixcc(self):
+        """Test that the ETL only downloads prefix.cc when asked, and then reports the changes."""
+        for refresh, expected in [(False, "a"), (True, "b")]:
+            snapshot, download = Context("prefixcc"), Context("prefixcc")
+            snapshot.add_prefix("a", "https://example.org/a/")
+            download.add_prefix("b", "https://example.org/b/")
+            sources = {name: (lambda name=name: Context(name)) for name in CONTEXTS}
+            sources["prefixcc"] = lambda snapshot=snapshot: snapshot
+            target = "prefixmaps.ingest.etl_runner.from_prefixcc"
+            with self.subTest(refresh=refresh), tempfile.TemporaryDirectory() as directory:
+                with mock.patch.dict(CONTEXTS, sources), mock.patch("click.echo") as echo:
+                    with mock.patch(target, return_value=download) as from_prefixcc_mock:
+                        run_etl(directory, refresh_prefixcc=refresh)
+                self.assertEqual(refresh, from_prefixcc_mock.called)
+                self.assertEqual(refresh, echo.called)
+                for name in ["prefixcc", "merged"]:
+                    with open(Path(directory) / f"{name}.csv", encoding="utf-8") as file:
+                        self.assertEqual([expected], list(context_from_file(name, file).as_dict()))
