@@ -1,13 +1,19 @@
 """Generic JSON-LD ingests."""
 
 import json
-from typing import Any, Dict, List, Optional, TextIO, Union
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, TextIO, Union
+from urllib.parse import urlparse
 
 import requests
+import yaml
 
+from prefixmaps.data import data_path
 from prefixmaps.datamodel.context import Context
 
 AT_CONTEXT = "@context"
+
+PREFIXCC_URL = "http://prefix.cc/context.jsonld"
 
 PREFIXCC_EXCLUDE = [
     "bp",
@@ -109,6 +115,60 @@ def from_prefixcc() -> Context:
     Longer term we should focus on the curated linked_data.yaml file, and
     moving this to bioregistry.
 
+    Spam and broken entries listed in prefixcc.excluded.yaml are dropped.
+
     :return:
     """
-    return from_jsonld_context_url("http://prefix.cc/context.jsonld", "prefixcc", PREFIXCC_EXCLUDE)
+    exclusions = load_prefixcc_exclusions()
+    jsonld_context = requests.get(url=PREFIXCC_URL).json()
+    if AT_CONTEXT in jsonld_context:
+        jsonld_context[AT_CONTEXT] = {
+            prefix: namespace
+            for prefix, namespace in jsonld_context[AT_CONTEXT].items()
+            if not (
+                isinstance(namespace, str)
+                and is_excluded_from_prefixcc(prefix, namespace, exclusions)
+            )
+        }
+    return from_jsonld_context(jsonld_context, "prefixcc", PREFIXCC_EXCLUDE)
+
+
+def load_prefixcc_exclusions(
+    path: Path = data_path / "prefixcc.excluded.yaml",
+) -> Mapping[str, Mapping[str, str]]:
+    """
+    Loads the prefix.cc entries that are never imported.
+
+    :param path: the exclusions file
+    :return: the excluded ``hosts`` and ``prefixes``, each mapped to the reason
+    """
+    with open(path, encoding="utf-8") as file:
+        exclusions = yaml.safe_load(file) or {}
+    unknown = set(exclusions) - {"hosts", "prefixes"}
+    if unknown:
+        # a misspelled key would otherwise silently disable those exclusions
+        raise ValueError(f"unknown keys in {path.name}: {sorted(unknown)}")
+    return {key: exclusions.get(key) or {} for key in ("hosts", "prefixes")}
+
+
+def is_excluded_from_prefixcc(
+    prefix: str, namespace: str, exclusions: Mapping[str, Mapping[str, str]]
+) -> bool:
+    """
+    Checks whether a prefix.cc entry is excluded by its prefix or by its namespace's host.
+
+    :param prefix:
+    :param namespace:
+    :param exclusions: as returned by :func:`load_prefixcc_exclusions`
+    :return: True if the entry must not be imported
+    """
+    if prefix in exclusions["prefixes"]:
+        return True
+    try:
+        host = (urlparse(namespace).hostname or "").rstrip(".")
+    except ValueError:
+        # not a URL with a parsable host, such as "http://[abc/"
+        return False
+    return any(
+        host == excluded or host.endswith(f".{excluded}") for excluded in exclusions["hosts"]
+    )
